@@ -202,7 +202,15 @@ public struct SendSyncChatView: View {
         let text = draft
         draft = ""
         Task {
-            await session.send(text, name: name, email: email)
+            // nil, not "". These fields are only shown to anonymous visitors,
+            // so for an identified user they are empty — and an empty string
+            // is still a value, which meant `name ?? identity?.name` in
+            // ChatSession never reached the name we already knew.
+            await session.send(
+                text,
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name,
+                email: email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : email
+            )
             if session.errorMessage != nil, draft.isEmpty { draft = text }
         }
     }
@@ -225,10 +233,19 @@ extension Color {
 // MARK: - UIKit
 
 extension SendSyncChat {
-    /// Present the chat full screen over `viewController` (UIKit apps).
-    public static func present(from viewController: UIViewController, animated: Bool = true) {
+    /// Present the chat as a sheet over `viewController` (UIKit apps).
+    ///
+    /// A page sheet rather than full screen: it is the idiom iOS users expect
+    /// for something they will dismiss and come back to, and it keeps the
+    /// host app visible behind. Pass `.fullScreen` yourself if you would
+    /// rather it took the whole screen.
+    public static func present(
+        from viewController: UIViewController,
+        animated: Bool = true,
+        modalPresentationStyle: UIModalPresentationStyle = .pageSheet
+    ) {
         let host = UIHostingController(rootView: SendSyncChatView())
-        host.modalPresentationStyle = .pageSheet
+        host.modalPresentationStyle = modalPresentationStyle
         viewController.present(host, animated: animated)
     }
 }

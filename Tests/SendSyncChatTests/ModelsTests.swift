@@ -20,7 +20,10 @@ final class ModelsTests: XCTestCase {
     }
 
     func testConfigWithoutFeaturesStillDecodes() throws {
-        let json = #"{"title":"Acme","color":"#000000","greeting":null,"offlineMessage":null,"online":false,"pipelines":[]}"#
+        // `##"…"##`, not `##"…"#`: the colour literal contains `"#`, which is
+        // exactly the delimiter that ends a `#"…"#` raw string — so the
+        // previous form closed mid-JSON and would not compile.
+        let json = ##"{"title":"Acme","color":"#000000","greeting":null,"offlineMessage":null,"online":false,"pipelines":[]}"##
         let c = try JSONDecoder().decode(ChatWidgetConfig.self, from: Data(json.utf8))
         XCTAssertNil(c.features)
     }
