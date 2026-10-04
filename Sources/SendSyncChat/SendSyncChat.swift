@@ -27,6 +27,18 @@ import UserNotifications
 public enum SendSyncChat {
     public static let sdkVersion = "1.0.0"
 
+    /**
+     Where the SDK says something went wrong that it then worked around.
+
+     A mismatched identity secret or an unregistered device produces no error a
+     host app would otherwise see — chat simply behaves worse. These print to
+     the console so the person integrating the SDK finds out during
+     integration, rather than from a customer months later.
+     */
+    static func warn(_ message: String) {
+        print("[SendSyncChat] \(message)")
+    }
+
     /// Which APNs environment this build's device token belongs to. Debug
     /// builds run from Xcode use the sandbox; TestFlight and App Store builds
     /// use production. Set explicitly if your setup differs.
