@@ -76,8 +76,8 @@ public struct SendSyncChatView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
 
-                    if !session.otherOpenConversations.isEmpty {
-                        otherConversations
+                    if session.hasHistory {
+                        earlierChats
                     }
 
                     ForEach(Array(session.messages.enumerated()), id: \.element.id) { index, m in
@@ -102,23 +102,40 @@ public struct SendSyncChatView: View {
         }
     }
 
-    /// The user's other open chats, when there is more than one. A plain list
-    /// rather than a second screen: this is rare, and a rare case deserves the
-    /// simplest thing that lets someone get where they are going.
+    /// Everything this customer has said to you before, open or ended.
+    ///
+    /// Ended ones belong here and used to be missing: an agent closing a chat
+    /// does not unsay what was in it, and a customer whose conversations had
+    /// all been closed opened the app to a blank new chat with no way back to
+    /// any of them — including one holding a reply they had never read.
+    ///
+    /// A plain list rather than a second screen: it keeps the whole thing one
+    /// tap deep, which is the right shape for something most people will open
+    /// once.
     @ViewBuilder
-    private var otherConversations: some View {
+    private var earlierChats: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Your other conversations")
+            Text("Earlier chats")
                 .font(.caption).foregroundColor(.secondary)
-            ForEach(session.otherOpenConversations) { c in
+            ForEach(session.history.filter { $0.id != session.conversationId }) { c in
                 Button {
                     session.select(conversationId: c.id)
                 } label: {
                     HStack(spacing: 8) {
-                        Text(c.lastMessagePreview ?? "No messages")
-                            .font(.footnote)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(c.lastMessagePreview ?? "No messages")
+                                .font(.footnote)
+                                .lineLimit(1)
+                            HStack(spacing: 4) {
+                                if let d = c.lastMessageAt {
+                                    Text(d.formatted(date: .abbreviated, time: .shortened))
+                                }
+                                if !c.isOpen { Text("· Ended") }
+                            }
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         if c.unreadCount > 0 {
                             Text("\(c.unreadCount)")
                                 .font(.caption2.weight(.semibold))

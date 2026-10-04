@@ -177,7 +177,15 @@ struct APIClient {
             request.httpBody = try JSONSerialization.data(withJSONObject: json)
         }
         auth?.apply(to: &request)
+        return try await perform(request)
+    }
 
+    /// Send a request that is already built, and decode what comes back.
+    ///
+    /// Split out of `send` so an upload — which carries raw bytes and its own
+    /// headers rather than a JSON body — gets the same error handling instead
+    /// of a second copy of it that drifts.
+    private func perform<T: Decodable>(_ request: URLRequest) async throws -> T {
         let data: Data
         let response: URLResponse
         do {
