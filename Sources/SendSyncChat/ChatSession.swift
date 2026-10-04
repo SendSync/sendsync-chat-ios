@@ -349,7 +349,17 @@ public final class ChatSession: ObservableObject {
     }
 
     public func startNewChat() {
+        // `reset()` empties the list because it also serves signing out, where
+        // the next person must not see the last one's conversations. Starting
+        // another chat is not that: these are the same customer's, the server
+        // still has them, and the one just left belongs in the list too — so
+        // it is put back, then re-read. Without this the history button
+        // disappears the moment somebody starts a new chat, which is exactly
+        // when they are most likely to want their way back.
+        let mine = history
         reset()
+        history = mine
+        Task { [weak self] in await self?.refreshConversations() }
     }
 
     // MARK: - context

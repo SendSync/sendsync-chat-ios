@@ -11,6 +11,13 @@ public struct SendSyncChatView: View {
     @ObservedObject private var session: ChatSession
     @Environment(\.dismiss) private var dismiss
     @State private var draft = ""
+    /// Whether the history list is covering the conversation.
+    ///
+    /// A swapped view rather than a navigation push: `NavigationStack` is iOS
+    /// 16 and this package supports 15, and the web widget does exactly this,
+    /// which is the point — a customer who uses both should not have to learn
+    /// two shapes. The back button is in the header either way.
+    @State private var showingHistory = false
     @State private var name = ""
     @State private var email = ""
 
@@ -32,9 +39,13 @@ public struct SendSyncChatView: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            messagesList
-            Divider()
-            footer
+            if showingHistory {
+                historyScreen
+            } else {
+                messagesList
+                Divider()
+                footer
+            }
         }
         .task { await session.load() }
         .onAppear { session.setVisible(true) }
@@ -55,6 +66,26 @@ public struct SendSyncChatView: View {
                 }
             }
             Spacer()
+            // Left of the ✕, as on the web. Only a signed-in customer has a
+            // history to reach: an anonymous visitor's chat lives on this
+            // device alone and there is nothing to list.
+            if showingHistory {
+                Button {
+                    showingHistory = false
+                } label: {
+                    Image(systemName: "chevron.left").font(.body.weight(.semibold))
+                }
+                .accessibilityLabel("Back to chat")
+                .padding(.trailing, 4)
+            } else if session.hasHistory {
+                Button {
+                    showingHistory = true
+                } label: {
+                    Image(systemName: "clock.arrow.circlepath").font(.body.weight(.semibold))
+                }
+                .accessibilityLabel("Earlier chats")
+                .padding(.trailing, 4)
+            }
             Button {
                 dismiss()
             } label: {
@@ -78,10 +109,6 @@ public struct SendSyncChatView: View {
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
-
-                    if session.hasHistory {
-                        earlierChats
-                    }
 
                     ForEach(Array(session.messages.enumerated()), id: \.element.id) { index, m in
                         bubble(m, showName: ChatMessage.showsAuthor(in: session.messages, at: index))
@@ -107,52 +134,83 @@ public struct SendSyncChatView: View {
 
     /// Everything this customer has said to you before, open or ended.
     ///
-    /// Ended ones belong here and used to be missing: an agent closing a chat
-    /// does not unsay what was in it, and a customer whose conversations had
-    /// all been closed opened the app to a blank new chat with no way back to
-    /// any of them — including one holding a reply they had never read.
+    /// Its own screen rather than a list wedged above the messages. Inline it
+    /// competed with the conversation, was easy to miss, and gave no hint that
+    /// a past chat was a thing you could go back to. Reaching one is now two
+    /// taps from anywhere: the clock in the header, then the chat.
     ///
-    /// A plain list rather than a second screen: it keeps the whole thing one
-    /// tap deep, which is the right shape for something most people will open
-    /// once.
-    @ViewBuilder
-    private var earlierChats: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Earlier chats")
-                .font(.caption).foregroundColor(.secondary)
-            ForEach(session.history.filter { $0.id != session.conversationId }) { c in
+    /// Ended ones belong here and were the reason for all of this: an agent
+    /// closing a chat does not unsay what was in it, and a customer whose
+    /// conversations had all been closed had no way back to any of them.
+    private var historyScreen: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
                 Button {
-                    session.select(conversationId: c.id)
+                    session.startNewChat()
+                    showingHistory = false
                 } label: {
                     HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(c.lastMessagePreview ?? "No messages")
-                                .font(.footnote)
-                                .lineLimit(1)
-                            HStack(spacing: 4) {
-                                if let d = c.lastMessageAt {
-                                    Text(d.formatted(date: .abbreviated, time: .shortened))
-                                }
-                                if !c.isOpen { Text("· Ended") }
-                            }
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        if c.unreadCount > 0 {
-                            Text("\(c.unreadCount)")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(Capsule().fill(accent))
-                        }
+                        Image(systemName: "square.and.pencil")
+                        Text("New chat").fontWeight(.medium)
+                        Spacer()
                     }
-                    .padding(10)
+                    .padding(12)
                     .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
                 }
                 .buttonStyle(.plain)
+                .foregroundColor(accent)
+
+                ForEach(session.history) { c in
+                    Button {
+                        // Already the one on screen: go back to it rather than
+                        // reloading it from nothing.
+                        if c.id != session.conversationId {
+                            session.select(conversationId: c.id)
+                        }
+                        showingHistory = false
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                if let d = c.lastMessageAt {
+                                    Text(d.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption).foregroundColor(.secondary)
+                                }
+                                if c.id == session.conversationId {
+                                    tag("Current")
+                                } else if !c.isOpen {
+                                    tag("Ended")
+                                }
+                                Spacer()
+                                if c.unreadCount > 0 {
+                                    Text("\(c.unreadCount)")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Capsule().fill(accent))
+                                }
+                            }
+                            Text(c.lastMessagePreview ?? "No messages")
+                                .font(.footnote)
+                                .foregroundColor(.primary)
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
+            .padding()
         }
+    }
+
+    private func tag(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Capsule().fill(Color(.tertiarySystemFill)))
     }
 
     @ViewBuilder
