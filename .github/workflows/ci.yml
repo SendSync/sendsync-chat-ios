@@ -1,0 +1,72 @@
+# Build and test the package on every push and pull request.
+#
+# This exists because nothing was checking. The four defects fixed in #1 were
+# all compile failures — exactly the class of bug a human reading a diff will
+# not catch and a build catches every time. A package distributed by SPM is
+# compiled by whoever installs it, so "does it build" is not an internal
+# detail; it is the product.
+#
+# macOS runners are needed for an iOS SDK: `xcodebuild -destination 'iOS
+# Simulator'` has no Linux equivalent. They bill at a higher rate than Linux on
+# a private repository; on a public one they are free.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes the run already going for that branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: swift test + xcodebuild test
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      # Builds for the host, which is the only reason Package.swift declares a
+      # macOS platform at all. Catches anything that fails to compile.
+      - name: swift build
+        run: swift build -v
+
+      - name: swift test
+        run: swift test -v
+
+      # Find whatever iPhone this runner image happens to carry, rather than
+      # pinning a name that silently stops existing on the next image bump.
+      - name: Pick a simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | grep -oE 'iPhone [0-9][A-Za-z0-9 ]*' \
+            | sed 's/[[:space:]]*$//' \
+            | head -1)
+          if [ -z "$NAME" ]; then
+            echo "No iPhone simulator on this runner:" >&2
+            xcrun simctl list devices available >&2
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Using: $NAME"
+
+      # And again for the platform that actually ships, so a change that only
+      # happens to compile for macOS cannot pass.
+      - name: xcodebuild test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme SendSyncChat \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
+            CODE_SIGNING_ALLOWED=NO

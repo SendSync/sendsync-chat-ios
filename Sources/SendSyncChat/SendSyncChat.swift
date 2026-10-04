@@ -57,11 +57,38 @@ public enum SendSyncChat {
     /// hex(HMAC-SHA256(identity secret, userId)), computed on your server —
     /// never put the secret in the app. Their chats then follow them across
     /// devices, and agents see them as verified.
-    public static func identify(userId: String, signature: String, name: String? = nil, email: String? = nil) {
-        let newIdentity = ChatIdentity(userId: userId, signature: signature, name: name, email: email)
+    /// `attributes` are display-only facts for the agent to see, e.g.
+    /// ["Next trip": "AUS→DAL Oct 8"]. They are never trusted for anything —
+    /// only `signature` proves who this is.
+    public static func identify(
+        userId: String,
+        signature: String,
+        name: String? = nil,
+        email: String? = nil,
+        attributes: [String: String]? = nil
+    ) {
+        let newIdentity = ChatIdentity(
+            userId: userId, signature: signature,
+            name: name, email: email, attributes: attributes
+        )
         identity = newIdentity
         session?.setIdentity(newIdentity)
+        // Registering here, rather than only when a chat is open, is what lets
+        // staff start a conversation and have it reach the phone.
+        if let session, deviceTokenHex != nil {
+            Task { await session.registerDeviceIfPossible() }
+        }
     }
+
+    /// Messages the signed-in user has not read, across all their chats.
+    /// Badge your own "Chat with us" button with this, and observe
+    /// ``unreadCountDidChange`` (or `session`, which is `ObservableObject`)
+    /// to keep it current.
+    public static var unreadCount: Int { session?.unreadCount ?? 0 }
+
+    /// Posted when ``unreadCount`` changes. `userInfo["unreadCount"]` is the
+    /// new value.
+    public static let unreadCountDidChange = Notification.Name("SendSyncChat.unreadCountDidChange")
 
     /// Call when the user signs out: stops push to this phone for their chats
     /// and clears the chat from this device.
@@ -78,6 +105,9 @@ public enum SendSyncChat {
     /// Pass the token from `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`.
     public static func setDeviceToken(_ token: Data) {
         deviceTokenHex = token.map { String(format: "%02x", $0) }.joined()
+        // Registers against the signed-in user when there is one, so it works
+        // with no conversation open — which is the case that matters, because
+        // a staff-started chat has nothing to register against yet.
         if let session { Task { await session.registerDeviceIfPossible() } }
     }
 

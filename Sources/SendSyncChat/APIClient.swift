@@ -46,6 +46,7 @@ struct APIClient {
             var user: [String: Any] = ["id": identity.userId, "signature": identity.signature]
             if let n = identity.name { user["name"] = n }
             if let e = identity.email { user["email"] = e }
+            if let a = identity.attributes, !a.isEmpty { user["attributes"] = a }
             payload["user"] = user
         }
         return try await send("POST", "widgets/\(widgetKey)/conversations", json: payload)
@@ -61,6 +62,34 @@ struct APIClient {
 
     func myConversations(identity: ChatIdentity) async throws -> MyConversations {
         try await send("GET", "widgets/\(widgetKey)/my-conversations", auth: .identity(identity))
+    }
+
+    /// Register this phone for every conversation the signed-in user is party
+    /// to — including ones staff started, which have no token to register
+    /// against and so cannot use the per-conversation route below.
+    func registerUserDevice(identity: ChatIdentity, apnsToken: String, environment: String) async throws {
+        let _: Empty = try await send(
+            "POST", "widgets/\(widgetKey)/my-devices",
+            json: ["apnsToken": apnsToken, "environment": environment],
+            auth: .identity(identity)
+        )
+    }
+
+    /// Stop sending to this phone. What `logout()` calls, so a handset the
+    /// user signed out of stops hearing about them.
+    func unregisterUserDevice(identity: ChatIdentity, apnsToken: String) async throws {
+        let _: Empty = try await send(
+            "DELETE", "widgets/\(widgetKey)/my-devices/\(apnsToken)",
+            auth: .identity(identity)
+        )
+    }
+
+    /// Mark everything up to `upToId` as seen, which clears the badge.
+    func markRead(conversationId: String, upToId: Int, auth: ChatAuth) async throws {
+        let _: Empty = try await send(
+            "POST", "conversations/\(conversationId)/read",
+            json: ["upToId": upToId], auth: auth
+        )
     }
 
     func registerDevice(conversationId: String, apnsToken: String, environment: String, auth: ChatAuth) async throws {

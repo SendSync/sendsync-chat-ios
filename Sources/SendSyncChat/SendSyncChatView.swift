@@ -76,8 +76,12 @@ public struct SendSyncChatView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground)))
 
+                    if !session.otherOpenConversations.isEmpty {
+                        otherConversations
+                    }
+
                     ForEach(Array(session.messages.enumerated()), id: \.element.id) { index, m in
-                        bubble(m, showName: m.sender == .agent && (index == 0 || session.messages[index - 1].sender != .agent))
+                        bubble(m, showName: ChatMessage.showsAuthor(in: session.messages, at: index))
                             .id(m.id)
                     }
                     if session.hasEnded {
@@ -98,11 +102,50 @@ public struct SendSyncChatView: View {
         }
     }
 
+    /// The user's other open chats, when there is more than one. A plain list
+    /// rather than a second screen: this is rare, and a rare case deserves the
+    /// simplest thing that lets someone get where they are going.
+    @ViewBuilder
+    private var otherConversations: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Your other conversations")
+                .font(.caption).foregroundColor(.secondary)
+            ForEach(session.otherOpenConversations) { c in
+                Button {
+                    session.select(conversationId: c.id)
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(c.lastMessagePreview ?? "No messages")
+                            .font(.footnote)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if c.unreadCount > 0 {
+                            Text("\(c.unreadCount)")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Capsule().fill(accent))
+                        }
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
     @ViewBuilder
     private func bubble(_ m: ChatMessage, showName: Bool) -> some View {
         switch m.sender {
         case .system:
-            Text(m.body).font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity)
+            VStack(spacing: 2) {
+                if showName, let n = m.authorName {
+                    Text(n).font(.caption2).foregroundColor(.secondary)
+                }
+                Text(m.body).font(.footnote).foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity)
         case .visitor:
             HStack {
                 Spacer(minLength: 48)
@@ -202,7 +245,15 @@ public struct SendSyncChatView: View {
         let text = draft
         draft = ""
         Task {
-            await session.send(text, name: name, email: email)
+            // nil, not "". These fields are only shown to anonymous visitors,
+            // so for an identified user they are empty — and an empty string
+            // is still a value, which meant `name ?? identity?.name` in
+            // ChatSession never reached the name we already knew.
+            await session.send(
+                text,
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name,
+                email: email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : email
+            )
             if session.errorMessage != nil, draft.isEmpty { draft = text }
         }
     }
@@ -225,10 +276,19 @@ extension Color {
 // MARK: - UIKit
 
 extension SendSyncChat {
-    /// Present the chat full screen over `viewController` (UIKit apps).
-    public static func present(from viewController: UIViewController, animated: Bool = true) {
+    /// Present the chat as a sheet over `viewController` (UIKit apps).
+    ///
+    /// A page sheet rather than full screen: it is the idiom iOS users expect
+    /// for something they will dismiss and come back to, and it keeps the
+    /// host app visible behind. Pass `.fullScreen` yourself if you would
+    /// rather it took the whole screen.
+    public static func present(
+        from viewController: UIViewController,
+        animated: Bool = true,
+        modalPresentationStyle: UIModalPresentationStyle = .pageSheet
+    ) {
         let host = UIHostingController(rootView: SendSyncChatView())
-        host.modalPresentationStyle = .pageSheet
+        host.modalPresentationStyle = modalPresentationStyle
         viewController.present(host, animated: animated)
     }
 }
