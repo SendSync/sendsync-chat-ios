@@ -32,6 +32,15 @@ public final class ChatSession: ObservableObject {
     /// Their other open conversations, when there is more than one. Empty in
     /// the ordinary case, so a host app can ignore it until it is not.
     @Published public private(set) var otherOpenConversations: [ChatConversationSummary] = []
+    /// The server would not accept the signature, so the chat has fallen back
+    /// to anonymous. Almost always a mismatched identity secret.
+    @Published public private(set) var identityRejected = false
+    /// Why the last device registration did not happen, if it did not.
+    ///
+    /// Push failing is otherwise completely silent: no notification arrives and
+    /// nothing says why. Surfaced so a developer integrating the SDK can see it
+    /// rather than discovering it from a customer.
+    @Published public private(set) var pushRegistrationError: String?
 
     let api: APIClient
     private(set) var identity: ChatIdentity?
@@ -123,7 +132,13 @@ public final class ChatSession: ObservableObject {
     /// several open at once, where the SDK keeps the newest and hands the rest
     /// to the host app rather than guessing.
     private func adoptLatestConversation(identity: ChatIdentity) async {
-        guard let mine = try? await api.myConversations(identity: identity) else { return }
+        let mine: MyConversations
+        do {
+            mine = try await api.myConversations(identity: identity)
+        } catch {
+            handleIfSignatureRejected(error)
+            return
+        }
         let open = mine.openConversations
         unreadCount = mine.conversations.reduce(0) { $0 + $1.unread }
         otherOpenConversations = open
@@ -188,6 +203,7 @@ public final class ChatSession: ObservableObject {
             // Chat gone or no longer ours (e.g. identity turned off): start fresh.
             reset()
         } catch {
+            if handleIfSignatureRejected(error) { return }
             // Transient; the next poll retries.
         }
     }
@@ -217,6 +233,12 @@ public final class ChatSession: ObservableObject {
                 await registerDeviceIfPossible()
             }
         } catch {
+            if handleIfSignatureRejected(error) {
+                // Anonymous now, and the composer will ask for a name and email.
+                // What they typed is not lost; the caller still holds it.
+                errorMessage = nil
+                return
+            }
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "Couldn't send"
         }
     }
@@ -228,11 +250,70 @@ public final class ChatSession: ObservableObject {
 
     // MARK: - identity & push (driven by SendSyncChat)
 
+    /**
+     Whether to ask the server again before concluding push is off.
+
+     Any answer other than a confident "push is on" is treated as stale. A
+     cached `false` is an answer from launch, and the APNs key may have been
+     added since — believing it would leave the phone unregistered until the
+     app was force-quit.
+     */
+    nonisolated static func shouldRefetchConfigBeforeRegistering(_ config: ChatWidgetConfig?) -> Bool {
+        config?.features?.push != true
+    }
+
+    /// A 401 on an identity-authenticated call means one thing: the signature
+    /// did not verify.
+    nonisolated static func isSignatureRejection(_ error: Error) -> Bool {
+        guard let chatError = error as? ChatError else { return false }
+        if case .server(let status, _) = chatError { return status == 401 }
+        return false
+    }
+
+    /**
+     Fall back to anonymous after the server refuses the signature.
+
+     Without this the chat is simply stuck: the composer hides the name and
+     email fields for an identified user, and every send fails, so the person
+     trying to ask a question has no way to ask it. A mismatched identity
+     secret is the app's problem to fix, not theirs to be blocked by.
+
+     A conversation adopted by signature has no token of its own and is no
+     longer reachable, so it goes; one started anonymously still has its token
+     and survives untouched.
+     */
+    func rejectIdentity(_ reason: String) {
+        guard !identityRejected else { return }
+        identityRejected = true
+        identity = nil
+        SendSyncChat.warn(
+            "the user signature was rejected (\(reason)). Check that it is "
+                + "hex(HMAC-SHA256(identity secret, userId)) and that the secret matches this "
+                + "widget's. Falling back to anonymous chat."
+        )
+        if stored?.token == nil {
+            reset()
+        }
+        errorMessage = nil
+        unreadCount = 0
+        otherOpenConversations = []
+    }
+
+    /// Returns true when the error was an identity rejection and was handled.
+    @discardableResult
+    func handleIfSignatureRejected(_ error: Error) -> Bool {
+        guard identity != nil, Self.isSignatureRejection(error) else { return false }
+        rejectIdentity((error as? LocalizedError)?.errorDescription ?? "401")
+        return true
+    }
+
     func setIdentity(_ newValue: ChatIdentity?) {
         if newValue?.userId != identity?.userId {
             // A different person: never show them the previous user's chat.
             reset()
         }
+        // A new signature deserves a new attempt, even if the last was refused.
+        if newValue != nil { identityRejected = false }
         identity = newValue
     }
 
@@ -245,26 +326,52 @@ public final class ChatSession: ObservableObject {
     /// user id to hang a device on.
     func registerDeviceIfPossible() async {
         guard let token = SendSyncChat.deviceTokenHex else { return }
-        // `identify` and `setDeviceToken` both land here, usually at launch and
-        // long before anything has shown the chat — so the config that says
-        // whether push is on has to be fetched rather than waited for. Without
-        // this the registration silently did nothing until the user opened the
-        // chat, which is exactly the case a staff-started conversation cannot
-        // rely on.
-        if config == nil { config = try? await api.config() }
-        guard config?.features?.push == true else { return }
-        if let identity {
-            try? await api.registerUserDevice(
-                identity: identity, apnsToken: token,
-                environment: SendSyncChat.pushEnvironment.rawValue
-            )
+
+        // Re-fetch whenever the config we hold does not say push is on — not
+        // only when we hold none.
+        //
+        // `identify` and `setDeviceToken` both land here at launch, long before
+        // anything shows the chat. A cached "push is off" is an answer from
+        // that moment: if the APNs key was missing then and added since, the
+        // old answer would keep this phone unregistered until the app was
+        // force-quit, which is exactly the silence this is meant to prevent.
+        if Self.shouldRefetchConfigBeforeRegistering(config) {
+            do {
+                config = try await api.config()
+            } catch {
+                pushRegistrationError = "Couldn't load the widget settings: \(error.localizedDescription)"
+                SendSyncChat.warn("could not load widget settings to register for push — \(error)")
+                return
+            }
+        }
+        guard config?.features?.push == true else {
+            pushRegistrationError = "Push notifications are not set up for this widget."
             return
         }
-        guard let id = conversationId, let auth else { return }
-        try? await api.registerDevice(
-            conversationId: id, apnsToken: token,
-            environment: SendSyncChat.pushEnvironment.rawValue, auth: auth
-        )
+
+        do {
+            if let identity {
+                try await api.registerUserDevice(
+                    identity: identity, apnsToken: token,
+                    environment: SendSyncChat.pushEnvironment.rawValue
+                )
+            } else if let id = conversationId, let auth {
+                try await api.registerDevice(
+                    conversationId: id, apnsToken: token,
+                    environment: SendSyncChat.pushEnvironment.rawValue, auth: auth
+                )
+            } else {
+                // Anonymous with no chat yet: nothing to register against, and
+                // nothing wrong.
+                return
+            }
+            pushRegistrationError = nil
+        } catch {
+            if handleIfSignatureRejected(error) { return }
+            pushRegistrationError = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            SendSyncChat.warn("could not register this device for push — \(error)")
+        }
     }
 
     func unregisterDevice() async {
