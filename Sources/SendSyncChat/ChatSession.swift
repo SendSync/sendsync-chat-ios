@@ -17,11 +17,32 @@ public final class ChatSession: ObservableObject {
     @Published public private(set) var isSending = false
     @Published public private(set) var isLoading = false
     @Published public var errorMessage: String?
+    /// Messages the user has not read, across every conversation they have.
+    /// Host apps badge their own "Chat with us" button with this.
+    @Published public private(set) var unreadCount = 0 {
+        didSet {
+            guard unreadCount != oldValue else { return }
+            NotificationCenter.default.post(
+                name: SendSyncChat.unreadCountDidChange,
+                object: nil,
+                userInfo: ["unreadCount": unreadCount]
+            )
+        }
+    }
+    /// Their other open conversations, when there is more than one. Empty in
+    /// the ordinary case, so a host app can ignore it until it is not.
+    @Published public private(set) var otherOpenConversations: [ChatConversationSummary] = []
 
     let api: APIClient
     private(set) var identity: ChatIdentity?
     private var stored: StoredChat?
     private var lastId = 0
+    /// How far we have told the server the user has read, so a poll that
+    /// brings nothing new does not spend a request saying so again.
+    private var readUpTo = 0
+    /// Unread messages in the conversation on screen, tracked separately so
+    /// marking it read subtracts the right amount from the total.
+    private var unreadInCurrent = 0
     private var pollTask: Task<Void, Never>?
     private var visible = false
 
@@ -86,15 +107,54 @@ public final class ChatSession: ObservableObject {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "Couldn't load chat"
             return
         }
-        if conversationId == nil, let identity {
-            // Same signed-in user on a new phone or after reinstalling: pick up
-            // their latest chat.
-            if let latest = try? await api.myConversations(identity: identity).conversations.first {
-                adopt(StoredChat(conversationId: latest.conversationId, token: nil, pipelineId: latest.pipelineId))
-            }
+        if let identity {
+            await adoptLatestConversation(identity: identity)
         }
         await refresh()
         await registerDeviceIfPossible()
+        await markReadIfVisible()
+    }
+
+    /// Pick up the conversation a signed-in user should be looking at.
+    ///
+    /// Three cases, and only the first used to work: a new phone or a fresh
+    /// install, where there is nothing stored; a staff- or server-started
+    /// conversation that arrived while this phone had an older one open; and
+    /// several open at once, where the SDK keeps the newest and hands the rest
+    /// to the host app rather than guessing.
+    private func adoptLatestConversation(identity: ChatIdentity) async {
+        guard let mine = try? await api.myConversations(identity: identity) else { return }
+        let open = mine.openConversations
+        unreadCount = mine.conversations.reduce(0) { $0 + $1.unread }
+        otherOpenConversations = open
+            .filter { $0.conversationId != conversationId }
+            .map(ChatConversationSummary.init)
+
+        guard let latest = open.first else { return }
+        if latest.conversationId == conversationId { return }
+
+        // Only move to something strictly newer than what is on screen. A
+        // conversation the user is in the middle of must not be yanked away by
+        // an older one surfacing.
+        if conversationId != nil {
+            let currentAt = mine.conversations
+                .first { $0.conversationId == conversationId }?.date
+            if let currentAt, let latestAt = latest.date, latestAt <= currentAt { return }
+        }
+        adopt(StoredChat(conversationId: latest.conversationId, token: nil, pipelineId: latest.pipelineId))
+        otherOpenConversations = open
+            .filter { $0.conversationId != latest.conversationId }
+            .map(ChatConversationSummary.init)
+    }
+
+    /// Switch to one of `otherOpenConversations`.
+    public func select(conversationId id: String) {
+        guard id != conversationId, identity != nil else { return }
+        adopt(StoredChat(conversationId: id, token: nil, pipelineId: nil))
+        Task {
+            await refresh()
+            await markReadIfVisible()
+        }
     }
 
     /// Call when the chat appears / disappears; polls quickly only while visible.
@@ -102,6 +162,8 @@ public final class ChatSession: ObservableObject {
         visible = isVisible
         pollTask?.cancel()
         guard isVisible else { return }
+        // Looking at it is reading it.
+        Task { await markReadIfVisible() }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -174,10 +236,31 @@ public final class ChatSession: ObservableObject {
         identity = newValue
     }
 
+    /// Tell the server this phone may be notified.
+    ///
+    /// A signed-in user registers against themselves, which works with no
+    /// conversation open at all — that is the only way a staff-started chat
+    /// can reach them, since there is nothing yet to register against.
+    /// Anonymous visitors keep the per-conversation registration, having no
+    /// user id to hang a device on.
     func registerDeviceIfPossible() async {
-        guard config?.features?.push == true,
-              let token = SendSyncChat.deviceTokenHex,
-              let id = conversationId, let auth else { return }
+        guard let token = SendSyncChat.deviceTokenHex else { return }
+        // `identify` and `setDeviceToken` both land here, usually at launch and
+        // long before anything has shown the chat — so the config that says
+        // whether push is on has to be fetched rather than waited for. Without
+        // this the registration silently did nothing until the user opened the
+        // chat, which is exactly the case a staff-started conversation cannot
+        // rely on.
+        if config == nil { config = try? await api.config() }
+        guard config?.features?.push == true else { return }
+        if let identity {
+            try? await api.registerUserDevice(
+                identity: identity, apnsToken: token,
+                environment: SendSyncChat.pushEnvironment.rawValue
+            )
+            return
+        }
+        guard let id = conversationId, let auth else { return }
         try? await api.registerDevice(
             conversationId: id, apnsToken: token,
             environment: SendSyncChat.pushEnvironment.rawValue, auth: auth
@@ -185,8 +268,26 @@ public final class ChatSession: ObservableObject {
     }
 
     func unregisterDevice() async {
-        guard let token = SendSyncChat.deviceTokenHex, let id = conversationId, let auth else { return }
+        guard let token = SendSyncChat.deviceTokenHex else { return }
+        if let identity {
+            try? await api.unregisterUserDevice(identity: identity, apnsToken: token)
+            return
+        }
+        guard let id = conversationId, let auth else { return }
         try? await api.unregisterDevice(conversationId: id, apnsToken: token, auth: auth)
+    }
+
+    /// Mark what is on screen as read, and drop the badge to match.
+    ///
+    /// Only while visible: a background poll that cleared the badge would mean
+    /// a customer loses the one signal that they have not looked yet.
+    func markReadIfVisible() async {
+        guard visible, let id = conversationId, let auth, lastId > 0 else { return }
+        guard lastId > readUpTo else { return }
+        try? await api.markRead(conversationId: id, upToId: lastId, auth: auth)
+        readUpTo = lastId
+        unreadCount = max(0, unreadCount - unreadInCurrent)
+        unreadInCurrent = 0
     }
 
     /// A tapped push for this widget: make sure that chat is the one shown.
@@ -205,6 +306,8 @@ public final class ChatSession: ObservableObject {
         selectedPipelineId = chat.pipelineId ?? selectedPipelineId
         messages = []
         lastId = 0
+        readUpTo = 0
+        unreadInCurrent = 0
         status = "open"
         if chat.token != nil {
             KeychainStore.save(chat, account: Self.account(api.widgetKey))
@@ -218,6 +321,10 @@ public final class ChatSession: ObservableObject {
         selectedPipelineId = nil
         messages = []
         lastId = 0
+        readUpTo = 0
+        unreadInCurrent = 0
+        unreadCount = 0
+        otherOpenConversations = []
         status = "open"
         errorMessage = nil
     }
@@ -228,6 +335,13 @@ public final class ChatSession: ObservableObject {
         guard !fresh.isEmpty else { return }
         messages.append(contentsOf: fresh)
         lastId = fresh.map(\.id).max() ?? lastId
+        // Their own messages are read by definition.
+        let theirs = fresh.filter { $0.sender != .visitor }.count
+        if theirs > 0 {
+            unreadInCurrent += theirs
+            unreadCount += theirs
+        }
+        if visible { Task { await markReadIfVisible() } }
     }
 
     static func clientInfo() -> [String: String] {
