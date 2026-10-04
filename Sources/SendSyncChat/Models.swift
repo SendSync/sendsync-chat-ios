@@ -13,6 +13,9 @@ public struct ChatWidgetConfig: Decodable, Equatable {
     public struct Features: Decodable, Equatable {
         public let identity: Bool
         public let push: Bool
+        /// Whether this widget lets customers send images. Absent on a server
+        /// older than this SDK, which is the same as off.
+        public var attachments: Bool? = nil
     }
 }
 
@@ -26,14 +29,79 @@ public struct ChatPipelineInfo: Decodable, Equatable, Identifiable {
     public let offlineMessage: String?
 }
 
+/// An image attached to a message.
+public struct ChatAttachment: Decodable, Equatable, Identifiable {
+    public let id: Int
+    public let fileName: String
+    public let contentType: String
+    public let byteSize: Int
+    /// A signed link that expires in minutes — fetch it when you show it, not
+    /// ahead of time. Nil when the server could not sign one, in which case
+    /// show the file name rather than a broken image.
+    public let url: String?
+}
+
+/// What image bytes actually are.
+///
+/// The server decides by the bytes rather than by what an upload claims, and
+/// refuses one where the two disagree — so the SDK has to label a photo
+/// correctly rather than assume. A picture out of the photo library is as
+/// often HEIC as it is JPEG.
+enum ChatImageType {
+    static func of(_ data: Data) -> String? {
+        let b = [UInt8](data.prefix(12))
+        guard b.count >= 12 else { return nil }
+        if b[0] == 0xFF, b[1] == 0xD8, b[2] == 0xFF { return "image/jpeg" }
+        if b[0] == 0x89, b[1] == 0x50, b[2] == 0x4E, b[3] == 0x47,
+           b[4] == 0x0D, b[5] == 0x0A, b[6] == 0x1A, b[7] == 0x0A { return "image/png" }
+        if b[0] == 0x47, b[1] == 0x49, b[2] == 0x46 { return "image/gif" }
+        if b[0] == 0x52, b[1] == 0x49, b[2] == 0x46, b[3] == 0x46,
+           b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 { return "image/webp" }
+        // An ISO base media container with an `ftyp` box; HEIC brands vary.
+        if b[4] == 0x66, b[5] == 0x74, b[6] == 0x79, b[7] == 0x70 { return "image/heic" }
+        return nil
+    }
+
+    static func fileExtension(_ contentType: String) -> String {
+        switch contentType {
+        case "image/jpeg": return "jpg"
+        case "image/png": return "png"
+        case "image/gif": return "gif"
+        case "image/webp": return "webp"
+        case "image/heic": return "heic"
+        default: return "img"
+        }
+    }
+}
+
 public struct ChatMessage: Decodable, Equatable, Identifiable {
     public enum Sender: String, Decodable { case visitor, agent, system }
     public let id: Int
     public let sender: Sender
     /// Agent's first name; nil for visitor and system messages.
     public let authorName: String?
+    /// Their photo, when the widget shows one. Nil otherwise.
+    public let authorAvatarUrl: String?
     public let body: String
     public let createdAt: String
+    public let attachments: [ChatAttachment]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, sender, authorName, authorAvatarUrl, body, createdAt, attachments
+    }
+
+    /// Hand-written so that a server older than this SDK — one that sends no
+    /// `attachments` and no avatar — decodes rather than throwing.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        sender = try c.decode(Sender.self, forKey: .sender)
+        authorName = try c.decodeIfPresent(String.self, forKey: .authorName)
+        authorAvatarUrl = try c.decodeIfPresent(String.self, forKey: .authorAvatarUrl)
+        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        attachments = try c.decodeIfPresent([ChatAttachment].self, forKey: .attachments) ?? []
+    }
 
     public var date: Date? { ChatMessage.parseDate(createdAt) }
 
@@ -105,6 +173,18 @@ struct MyConversations: Decodable {
             .filter(\.isOpen)
             .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
     }
+
+    /// Every conversation this customer has, newest first, whatever its
+    /// status.
+    ///
+    /// Closed ones belong here: an agent ending a chat does not unsay what
+    /// was said in it, and a customer whose conversations have all been
+    /// closed would otherwise open the app to a blank new chat with no way
+    /// back to any of them. `openConversations` stays for the places that
+    /// genuinely mean "still running".
+    var allConversations: [Item] {
+        conversations.sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+    }
 }
 
 /// One of the user's conversations, for a host app (or the SDK's own list)
@@ -115,6 +195,10 @@ public struct ChatConversationSummary: Identifiable, Equatable {
     public let unreadCount: Int
     public let lastMessagePreview: String?
     public let lastMessageAt: Date?
+    /// "open" or "closed". A list that shows both has to be able to say which.
+    public let status: String
+
+    public var isOpen: Bool { status == "open" }
 
     init(_ item: MyConversations.Item) {
         self.id = item.conversationId
@@ -122,6 +206,7 @@ public struct ChatConversationSummary: Identifiable, Equatable {
         self.unreadCount = item.unread
         self.lastMessagePreview = item.lastMessagePreview
         self.lastMessageAt = item.date
+        self.status = item.status
     }
 }
 

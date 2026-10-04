@@ -60,6 +60,58 @@ struct APIClient {
         try await send("POST", "conversations/\(conversationId)/messages", json: ["body": body, "after": after], auth: auth)
     }
 
+    /// Tell the agent what this customer is doing right now.
+    ///
+    /// An app has no URL to send, so the screen's name takes the place of a
+    /// page title. The server stores it only when something changed, so
+    /// calling this on every poll is cheap.
+    func setContext(
+        conversationId: String,
+        screen: String?,
+        context: [String: String],
+        auth: ChatAuth
+    ) async throws {
+        var payload: [String: Any] = ["context": context]
+        if let screen, !screen.isEmpty { payload["currentTitle"] = screen }
+        let _: Empty = try await send(
+            "POST", "conversations/\(conversationId)/context", json: payload, auth: auth
+        )
+    }
+
+    /// Send an image. Raw bytes with the caption in a header, matching the
+    /// server — multipart would mean a parser on both sides for one file.
+    func uploadImage(
+        conversationId: String,
+        data: Data,
+        fileName: String,
+        contentType: String,
+        caption: String?,
+        after: Int,
+        auth: ChatAuth
+    ) async throws -> ConversationView {
+        var request = URLRequest(url: base.appendingPathComponent("conversations/\(conversationId)/attachments"))
+        request.httpMethod = "POST"
+        // Longer than the usual 20s: this is a photo over a phone connection.
+        request.timeoutInterval = 120
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.headerSafe(fileName), forHTTPHeaderField: "X-File-Name")
+        request.setValue(String(after), forHTTPHeaderField: "X-After")
+        if let caption, !caption.isEmpty {
+            request.setValue(Self.headerSafe(caption), forHTTPHeaderField: "X-Caption")
+        }
+        request.httpBody = data
+        auth.apply(to: &request)
+        return try await perform(request)
+    }
+
+    /// A header value the server can read back with `decodeURIComponent`.
+    /// Percent-encoding everything non-alphanumeric keeps a name with an emoji
+    /// or a newline in it from being a malformed header.
+    static func headerSafe(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+    }
+
     func myConversations(identity: ChatIdentity) async throws -> MyConversations {
         try await send("GET", "widgets/\(widgetKey)/my-conversations", auth: .identity(identity))
     }

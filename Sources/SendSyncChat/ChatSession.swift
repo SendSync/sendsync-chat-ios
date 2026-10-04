@@ -32,6 +32,18 @@ public final class ChatSession: ObservableObject {
     /// Their other open conversations, when there is more than one. Empty in
     /// the ordinary case, so a host app can ignore it until it is not.
     @Published public private(set) var otherOpenConversations: [ChatConversationSummary] = []
+    /// Every conversation this customer has had, newest first, whatever its
+    /// status — what "Earlier chats" lists.
+    ///
+    /// Closed ones are the point. `unreadCount` counts messages in all of
+    /// them, so if the list stopped at the open ones an unread reply in a
+    /// conversation an agent had since closed would be counted and
+    /// unreachable: a badge that could never be cleared. Ending a chat does
+    /// not unsay what was said in it.
+    ///
+    /// Only ever populated for a signed-in customer: an anonymous one exists
+    /// on this phone alone, and there is nothing to list them from.
+    @Published public private(set) var history: [ChatConversationSummary] = []
     /// The server would not accept the signature, so the chat has fallen back
     /// to anonymous. Almost always a mismatched identity secret.
     @Published public private(set) var identityRejected = false
@@ -54,6 +66,12 @@ public final class ChatSession: ObservableObject {
     private var unreadInCurrent = 0
     private var pollTask: Task<Void, Never>?
     private var visible = false
+    /// What the host app has told us about this customer, the screen they are
+    /// on, and the last snapshot actually sent — so an idle chat does not post
+    /// the same thing every three seconds.
+    private var context: [String: String] = [:]
+    private var screenName: String?
+    private var sentContext: String?
 
     struct StoredChat: Codable {
         let conversationId: String
@@ -87,6 +105,11 @@ public final class ChatSession: ObservableObject {
 
     public var isOnline: Bool { selectedPipeline?.online ?? config?.online ?? false }
     public var isIdentified: Bool { identity != nil }
+    /// Whether to offer a photo button: the widget allows it, and there is a
+    /// chat to attach to.
+    public var canAttachImages: Bool { config?.features?.attachments == true && conversationId != nil }
+    /// Whether there is anything to go back to.
+    public var hasHistory: Bool { history.contains { $0.id != conversationId } }
     public var hasEnded: Bool { conversationId != nil && status == "closed" }
 
     /// The text shown at the top of the conversation.
@@ -132,37 +155,75 @@ public final class ChatSession: ObservableObject {
     /// several open at once, where the SDK keeps the newest and hands the rest
     /// to the host app rather than guessing.
     private func adoptLatestConversation(identity: ChatIdentity) async {
+        guard let mine = await refreshConversations(identity: identity) else { return }
+        let all = mine.allConversations
+
+        guard let landing = Self.landingConversation(all) else { return }
+        if landing.conversationId == conversationId { return }
+
+        // Only move to something strictly newer than what is on screen. A
+        // conversation the user is in the middle of must not be yanked away by
+        // an older one surfacing — unless that one is holding unread messages,
+        // which is the thing they opened the chat to read.
+        if conversationId != nil, landing.unread == 0 {
+            let currentAt = mine.conversations
+                .first { $0.conversationId == conversationId }?.date
+            if let currentAt, let landingAt = landing.date, landingAt <= currentAt { return }
+        }
+        adopt(StoredChat(conversationId: landing.conversationId, token: nil, pipelineId: landing.pipelineId))
+        otherOpenConversations = mine.openConversations
+            .filter { $0.conversationId != landing.conversationId }
+            .map(ChatConversationSummary.init)
+    }
+
+    /// Re-read this customer's conversations: the "Earlier chats" list, and
+    /// the unread count behind it.
+    ///
+    /// Worth calling whenever the app may have missed something — on load, as
+    /// soon as somebody signs in, and when the app returns to the foreground.
+    /// A host app badging its own entry point needs a number before anyone
+    /// opens the chat, and the only other way to learn one is a push the
+    /// customer may never have allowed.
+    ///
+    /// Deliberately does not change which conversation is on screen. Coming
+    /// back to the app is not a request to be moved somewhere else, and a
+    /// reply arriving in another thread must not pull someone out of the one
+    /// they are in the middle of reading. Only `load()` adopts.
+    @discardableResult
+    public func refreshConversations() async -> Bool {
+        guard let identity else { return false }
+        return await refreshConversations(identity: identity) != nil
+    }
+
+    @discardableResult
+    private func refreshConversations(identity: ChatIdentity) async -> MyConversations? {
         let mine: MyConversations
         do {
             mine = try await api.myConversations(identity: identity)
         } catch {
             handleIfSignatureRejected(error)
-            return
+            return nil
         }
-        let open = mine.openConversations
         unreadCount = mine.conversations.reduce(0) { $0 + $1.unread }
-        otherOpenConversations = open
+        history = mine.allConversations.map(ChatConversationSummary.init)
+        otherOpenConversations = mine.openConversations
             .filter { $0.conversationId != conversationId }
             .map(ChatConversationSummary.init)
-
-        guard let latest = open.first else { return }
-        if latest.conversationId == conversationId { return }
-
-        // Only move to something strictly newer than what is on screen. A
-        // conversation the user is in the middle of must not be yanked away by
-        // an older one surfacing.
-        if conversationId != nil {
-            let currentAt = mine.conversations
-                .first { $0.conversationId == conversationId }?.date
-            if let currentAt, let latestAt = latest.date, latestAt <= currentAt { return }
-        }
-        adopt(StoredChat(conversationId: latest.conversationId, token: nil, pipelineId: latest.pipelineId))
-        otherOpenConversations = open
-            .filter { $0.conversationId != latest.conversationId }
-            .map(ChatConversationSummary.init)
+        return mine
     }
 
-    /// Switch to one of `otherOpenConversations`.
+    /// Which conversation to open on.
+    ///
+    /// Whichever holds unread messages, else the newest. An unread reply is
+    /// usually the reason they opened the chat at all, and it is as often in
+    /// a conversation an agent has since closed — landing on the newest would
+    /// put it behind a button. The list arrives newest first, so the first
+    /// unread is the most recent one.
+    static func landingConversation(_ all: [MyConversations.Item]) -> MyConversations.Item? {
+        all.first { $0.unread > 0 } ?? all.first
+    }
+
+    /// Switch to one of `history` or `otherOpenConversations`.
     public func select(conversationId id: String) {
         guard id != conversationId, identity != nil else { return }
         adopt(StoredChat(conversationId: id, token: nil, pipelineId: nil))
@@ -196,6 +257,8 @@ public final class ChatSession: ObservableObject {
     /// Fetch new messages for the current chat.
     public func refresh() async {
         guard let id = conversationId, let auth else { return }
+        // Rides along with the poll. Returns immediately when nothing changed.
+        await sendContextIfChanged()
         do {
             let view = try await api.messages(conversationId: id, after: lastId, auth: auth)
             apply(view)
@@ -244,8 +307,91 @@ public final class ChatSession: ObservableObject {
     }
 
     /// Forget the current chat (after it ended) so the visitor can start another.
+    /// Send a photo.
+    ///
+    /// The caption goes up with the image rather than as a message of its own,
+    /// so the customer sees one bubble. There has to be a chat already: an
+    /// image needs something to attach to, and a photo on its own gives the
+    /// agent nothing to answer.
+    public func send(
+        image data: Data,
+        fileName: String? = nil,
+        contentType: String? = nil,
+        caption: String = ""
+    ) async {
+        guard !isSending else { return }
+        // Read from the bytes unless the app insisted: the server compares the
+        // claim against what it finds and refuses the upload if they disagree.
+        guard let type = contentType ?? ChatImageType.of(data) else {
+            errorMessage = "That file isn't an image we can send."
+            return
+        }
+        guard let id = conversationId, let auth else {
+            errorMessage = "Send a message first, then you can attach a photo."
+            return
+        }
+        isSending = true
+        errorMessage = nil
+        defer { isSending = false }
+        do {
+            apply(try await api.uploadImage(
+                conversationId: id,
+                data: data,
+                fileName: fileName ?? "photo.\(ChatImageType.fileExtension(type))",
+                contentType: type,
+                caption: caption.trimmingCharacters(in: .whitespacesAndNewlines),
+                after: lastId,
+                auth: auth
+            ))
+        } catch {
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? "Couldn't send that image"
+        }
+    }
+
     public func startNewChat() {
         reset()
+    }
+
+    // MARK: - context
+
+    /// What this customer is doing, for the agent answering them.
+    ///
+    /// Replaces whatever was set before, so pass the whole picture. Safe to
+    /// call on every screen change — nothing is sent unless it changed.
+    public func setContext(_ facts: [String: String], screen: String? = nil) {
+        context = Self.cleaned(facts)
+        screenName = screen?.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { await sendContextIfChanged() }
+    }
+
+    private func sendContextIfChanged() async {
+        guard let id = conversationId, let auth else { return }
+        let snapshot = ([id, screenName ?? ""] + context.keys.sorted().map { "\($0)=\(context[$0] ?? "")" })
+            .joined(separator: "\u{1}")
+        guard snapshot != sentContext else { return }
+        // Recorded before the request: a failure is picked up by the next
+        // change or the next poll, and a retry storm behind a dead network
+        // helps nobody.
+        sentContext = snapshot
+        do {
+            try await api.setContext(conversationId: id, screen: screenName, context: context, auth: auth)
+        } catch {
+            sentContext = nil
+        }
+    }
+
+    /// The same caps the server applies, so a host app sending too much finds
+    /// out here rather than silently losing half of it.
+    private static func cleaned(_ facts: [String: String]) -> [String: String] {
+        var out: [String: String] = [:]
+        for key in facts.keys.sorted() {
+            if out.count >= 20 { break }
+            let k = String(key.prefix(48)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let v = String((facts[key] ?? "").prefix(300)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if k.isEmpty || v.isEmpty { continue }
+            out[k] = v
+        }
+        return out
     }
 
     // MARK: - identity & push (driven by SendSyncChat)
@@ -315,6 +461,11 @@ public final class ChatSession: ObservableObject {
         // A new signature deserves a new attempt, even if the last was refused.
         if newValue != nil { identityRejected = false }
         identity = newValue
+        guard newValue != nil else { return }
+        // They have conversations we know nothing about yet. Waiting for the
+        // chat to be opened would leave a host app badging its own entry point
+        // with nothing until then.
+        Task { [weak self] in await self?.refreshConversations() }
     }
 
     /// Tell the server this phone may be notified.
@@ -409,6 +560,8 @@ public final class ChatSession: ObservableObject {
 
     private func adopt(_ chat: StoredChat) {
         stored = chat
+        // A different conversation, so whatever we last sent does not count.
+        sentContext = nil
         conversationId = chat.conversationId
         selectedPipelineId = chat.pipelineId ?? selectedPipelineId
         messages = []
@@ -432,6 +585,11 @@ public final class ChatSession: ObservableObject {
         unreadInCurrent = 0
         unreadCount = 0
         otherOpenConversations = []
+        history = []
+        // The facts stay — they are about this customer, not this chat. Only
+        // the record of having sent them is dropped, so the next conversation
+        // gets its own copy.
+        sentContext = nil
         status = "open"
         errorMessage = nil
     }

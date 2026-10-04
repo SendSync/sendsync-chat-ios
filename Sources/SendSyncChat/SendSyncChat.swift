@@ -56,6 +56,16 @@ public enum SendSyncChat {
     static var deviceTokenHex: String?
     /// Kept here too so `identify` works before or after `configure`.
     private static var identity: ChatIdentity?
+    /// Likewise for `setContext`, which an app may call from a screen that
+    /// appears before chat is configured.
+    private static var context: (facts: [String: String], screen: String?)?
+    /// Kept so reconfiguring does not leave a second observer behind. Held
+    /// here rather than on `ChatSession` because this enum lives as long as
+    /// the app does, so there is no deinit that has to remember to tear it
+    /// down.
+    #if canImport(UIKit)
+    private static var foregroundObserver: NSObjectProtocol?
+    #endif
 
     /// Set up chat for one widget. `host` is where SendSync runs for you
     /// (defaults to https://sendsync.com).
@@ -63,6 +73,43 @@ public enum SendSyncChat {
         precondition(widgetKey.hasPrefix("chw_"), "SendSyncChat: widgetKey should start with chw_ (copy it from Live chat → your widget → Install → iOS app)")
         if session?.api.widgetKey == widgetKey && session?.api.host == host { return }
         session = ChatSession(api: APIClient(host: host, widgetKey: widgetKey), identity: identity)
+        if let context { session?.setContext(context.facts, screen: context.screen) }
+        observeForeground()
+    }
+
+    /// Tell SendSync what this customer is doing, so whoever answers has the
+    /// context — the screen they are on, their plan, what is in their basket:
+    ///
+    /// ```swift
+    /// SendSyncChat.setContext(["Plan": "Pro", "Booking": "#8821"], screen: "Booking review")
+    /// ```
+    ///
+    /// Replaces whatever was set before, so pass the whole picture. Safe to
+    /// call on every screen change: nothing is sent unless it changed, and
+    /// nothing at all until there is a chat to attach it to.
+    public static func setContext(_ facts: [String: String], screen: String? = nil) {
+        context = (facts, screen)
+        session?.setContext(facts, screen: screen)
+    }
+
+    /// Re-read the customer's conversations whenever the app comes back.
+    ///
+    /// Time passes while an app is in the background and replies arrive in it.
+    /// Without this the unread count would be whatever it was when they last
+    /// had the app open, so a host app badging its own entry point would show
+    /// a stale number until somebody opened the chat — which is the one thing
+    /// a badge exists to prompt.
+    private static func observeForeground() {
+        #if canImport(UIKit)
+        if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in await SendSyncChat.session?.refreshConversations() }
+        }
+        #endif
     }
 
     /// Tell SendSync who the signed-in user is. `signature` is
@@ -106,6 +153,8 @@ public enum SendSyncChat {
     /// and clears the chat from this device.
     public static func logout() {
         identity = nil
+        // Whatever we knew was about the person signing out.
+        context = nil
         guard let session else { return }
         Task {
             await session.unregisterDevice()
