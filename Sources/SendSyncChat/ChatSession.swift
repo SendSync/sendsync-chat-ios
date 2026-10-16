@@ -547,10 +547,13 @@ public final class ChatSession: ObservableObject {
 
     /// Mark what is on screen as read, and drop the badge to match.
     ///
-    /// Only while visible: a background poll that cleared the badge would mean
-    /// a customer loses the one signal that they have not looked yet.
+    /// Only while visible AND the app is in front: a background poll that
+    /// cleared the badge would mean a customer loses the one signal that they
+    /// have not looked yet — and the agent would be told "Seen" for a message
+    /// nobody saw. A chat screen left open behind the home screen is still
+    /// "visible" to SwiftUI, hence the app-state check.
     func markReadIfVisible() async {
-        guard visible, let id = conversationId, let auth, lastId > 0 else { return }
+        guard visible, Self.appIsActive, let id = conversationId, let auth, lastId > 0 else { return }
         guard lastId > readUpTo else { return }
         try? await api.markRead(conversationId: id, upToId: lastId, auth: auth)
         readUpTo = lastId
@@ -617,6 +620,14 @@ public final class ChatSession: ObservableObject {
             unreadCount += theirs
         }
         if visible { Task { await markReadIfVisible() } }
+    }
+
+    static var appIsActive: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState == .active
+        #else
+        return true
+        #endif
     }
 
     static func clientInfo() -> [String: String] {

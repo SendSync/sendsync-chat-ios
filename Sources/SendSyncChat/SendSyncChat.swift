@@ -65,6 +65,7 @@ public enum SendSyncChat {
     /// down.
     #if canImport(UIKit)
     private static var foregroundObserver: NSObjectProtocol?
+    private static var activeObserver: NSObjectProtocol?
     #endif
 
     /// Set up chat for one widget. `host` is where SendSync runs for you
@@ -108,6 +109,20 @@ public enum SendSyncChat {
             queue: .main
         ) { _ in
             Task { @MainActor in await SendSyncChat.session?.refreshConversations() }
+        }
+        // Back in front with the chat on screen: what they're looking at is
+        // read now. didBecomeActive, not willEnterForeground — the app isn't
+        // `.active` yet at willEnterForeground, so the read would be refused.
+        if let activeObserver { NotificationCenter.default.removeObserver(activeObserver) }
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                await SendSyncChat.session?.refresh()
+                await SendSyncChat.session?.markReadIfVisible()
+            }
         }
         #endif
     }
