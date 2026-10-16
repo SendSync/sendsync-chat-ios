@@ -20,6 +20,7 @@ public struct SendSyncChatView: View {
     @State private var showingHistory = false
     @State private var name = ""
     @State private var email = ""
+    @State private var phone = ""
 
     /// Uses the session from `SendSyncChat.configure(widgetKey:)`.
     @MainActor
@@ -322,17 +323,14 @@ public struct SendSyncChatView: View {
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
-            if first && !session.isIdentified {
+            let fields = session.prechatFields
+            if first && !fields.isEmpty {
+                // Name and email side by side, as before; phone beneath.
                 HStack {
-                    TextField("Your name (optional)", text: $name)
-                        .textContentType(.name)
-                    TextField(session.isOnline ? "Email (optional)" : "Your email", text: $email)
-                        .textContentType(.emailAddress)
-                        .keyboardType(.emailAddress)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    if fields.contains(.name) { detailField(.name, text: $name) }
+                    if fields.contains(.email) { detailField(.email, text: $email) }
                 }
-                .textFieldStyle(.roundedBorder)
+                if fields.contains(.phone) { detailField(.phone, text: $phone) }
             }
             if let error = session.errorMessage {
                 Text(error).font(.footnote).foregroundColor(.red)
@@ -366,6 +364,41 @@ public struct SendSyncChatView: View {
         .padding()
     }
 
+    @ViewBuilder
+    private func detailField(_ field: ChatPrechat.Field, text: Binding<String>) -> some View {
+        let label: String = {
+            switch field {
+            case .name: return "Your name"
+            case .email: return "Your email"
+            case .phone: return "Phone number"
+            }
+        }()
+        let required = session.isRequired(field)
+        let invalid = session.errorField == field
+        let input = TextField(required ? label : "\(label) (optional)", text: text)
+            .textFieldStyle(.roundedBorder)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.red, lineWidth: invalid ? 1 : 0)
+            )
+            .accessibilityLabel(label)
+            .accessibilityHint(required ? "Required" : "Optional")
+        switch field {
+        case .name:
+            input.textContentType(.name)
+        case .email:
+            input
+                .textContentType(.emailAddress)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+        case .phone:
+            input
+                .textContentType(.telephoneNumber)
+                .keyboardType(.phonePad)
+        }
+    }
+
     @MainActor
     private func send() {
         let text = draft
@@ -378,7 +411,8 @@ public struct SendSyncChatView: View {
             await session.send(
                 text,
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : name,
-                email: email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : email
+                email: email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : email,
+                phone: phone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : phone
             )
             if session.errorMessage != nil, draft.isEmpty { draft = text }
         }

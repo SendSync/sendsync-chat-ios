@@ -55,11 +55,19 @@ id, and the app passes that signature along:
 
 ```swift
 // after your user signs in — `signature` comes from your server
-SendSyncChat.identify(userId: user.id, signature: signature, name: user.name, email: user.email)
+SendSyncChat.identify(userId: user.id, signature: signature,
+                      name: user.name, email: user.email, phone: user.phone)
 
 // when they sign out
 SendSyncChat.logout()
 ```
+
+Each widget decides what to ask before a chat starts (name, email, phone:
+required, optional or not asked — all required unless you change it in
+SendSync). The chat screen shows those fields to anonymous users. A signed-in
+user isn't asked for anything up front: pass what your app knows to
+`identify`, and the chat screen asks only for a required detail that neither
+your app nor SendSync's records have.
 
 Server side — `signature = hex(HMAC-SHA256(secret, userId))`:
 

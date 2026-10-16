@@ -16,7 +16,7 @@ import UserNotifications
 /// SendSyncChat.present(from: self)
 ///
 /// // 3. Optional: signed-in users (signature comes from YOUR server)
-/// SendSyncChat.identify(userId: user.id, signature: sig, name: user.name, email: user.email)
+/// SendSyncChat.identify(userId: user.id, signature: sig, name: user.name, email: user.email, phone: user.phone)
 /// SendSyncChat.logout()
 ///
 /// // 4. Optional: push notifications
@@ -139,11 +139,12 @@ public enum SendSyncChat {
         signature: String,
         name: String? = nil,
         email: String? = nil,
+        phone: String? = nil,
         attributes: [String: String]? = nil
     ) {
         let newIdentity = ChatIdentity(
             userId: userId, signature: signature,
-            name: name, email: email, attributes: attributes
+            name: name, email: email, phone: phone, attributes: attributes
         )
         identity = newIdentity
         session?.setIdentity(newIdentity)

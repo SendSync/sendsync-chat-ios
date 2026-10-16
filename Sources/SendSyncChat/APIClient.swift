@@ -35,6 +35,7 @@ struct APIClient {
         body: String,
         name: String?,
         email: String?,
+        phone: String? = nil,
         identity: ChatIdentity?,
         client: [String: String]
     ) async throws -> StartResponse {
@@ -42,10 +43,12 @@ struct APIClient {
         if let pipelineId { payload["pipelineId"] = pipelineId }
         if let name, !name.isEmpty { payload["name"] = name }
         if let email, !email.isEmpty { payload["email"] = email }
+        if let phone, !phone.isEmpty { payload["phone"] = phone }
         if let identity {
             var user: [String: Any] = ["id": identity.userId, "signature": identity.signature]
             if let n = identity.name { user["name"] = n }
             if let e = identity.email { user["email"] = e }
+            if let p = identity.phone { user["phone"] = p }
             if let a = identity.attributes, !a.isEmpty { user["attributes"] = a }
             payload["user"] = user
         }
@@ -195,7 +198,11 @@ struct APIClient {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
-            let message = (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error ?? "Request failed (\(status))"
+            let body = try? JSONDecoder().decode(ErrorBody.self, from: data)
+            let message = body?.error ?? "Request failed (\(status))"
+            if status == 400, let field = body?.field {
+                throw ChatError.missingDetail(field: field, message: message)
+            }
             throw ChatError.server(status: status, message: message)
         }
         if status == 204 || data.isEmpty, let empty = Empty() as? T { return empty }
