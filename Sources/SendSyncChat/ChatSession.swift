@@ -17,6 +17,11 @@ public final class ChatSession: ObservableObject {
     @Published public private(set) var isSending = false
     @Published public private(set) var isLoading = false
     @Published public var errorMessage: String?
+    /// Details the server said it still needs before the chat can start —
+    /// shown even to a signed-in user, whose app may not have sent them.
+    @Published public private(set) var askedFields: Set<ChatPrechat.Field> = []
+    /// The field `errorMessage` is about, to highlight.
+    @Published public var errorField: ChatPrechat.Field?
     /// Messages the user has not read, across every conversation they have.
     /// Host apps badge their own "Chat with us" button with this.
     @Published public private(set) var unreadCount = 0 {
@@ -105,6 +110,24 @@ public final class ChatSession: ObservableObject {
 
     public var isOnline: Bool { selectedPipeline?.online ?? config?.online ?? false }
     public var isIdentified: Bool { identity != nil }
+
+    /// What this widget asks for before a chat starts.
+    public var prechat: ChatPrechat { config?.prechat ?? .legacy }
+
+    /// The fields to show before the first message. A signed-in user isn't
+    /// asked up front — their app told us who they are, and the server fills
+    /// gaps from what it has on file — only for what it still turns out to need.
+    public var prechatFields: [ChatPrechat.Field] {
+        guard conversationId == nil else { return [] }
+        return ChatPrechat.Field.allCases.filter { f in
+            askedFields.contains(f) || (!isIdentified && prechat.mode(f) != .off)
+        }
+    }
+
+    /// Whether `field` must be filled in before sending.
+    public func isRequired(_ field: ChatPrechat.Field) -> Bool {
+        askedFields.contains(field) || prechat.isRequired(field, online: isOnline)
+    }
     /// Whether to offer a photo button: the widget allows it, and there is a
     /// chat to attach to.
     public var canAttachImages: Bool { config?.features?.attachments == true && conversationId != nil }
@@ -273,11 +296,30 @@ public final class ChatSession: ObservableObject {
 
     // MARK: - actions
 
-    public func send(_ text: String, name: String? = nil, email: String? = nil) async {
+    public func send(_ text: String, name: String? = nil, email: String? = nil, phone: String? = nil) async {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, !isSending else { return }
+        if conversationId == nil {
+            var p = prechat
+            for f in askedFields {
+                switch f {
+                case .name: p.name = .required
+                case .email: p.email = .required
+                case .phone: p.phone = .required
+                }
+            }
+            if let problem = p.check(
+                name: name, email: email, phone: phone,
+                asked: Set(prechatFields), online: isOnline
+            ) {
+                errorMessage = problem.message
+                errorField = problem.field
+                return
+            }
+        }
         isSending = true
         errorMessage = nil
+        errorField = nil
         defer { isSending = false }
         do {
             if let id = conversationId, let auth {
@@ -288,6 +330,7 @@ public final class ChatSession: ObservableObject {
                     body: body,
                     name: name ?? identity?.name,
                     email: email ?? identity?.email,
+                    phone: phone ?? identity?.phone,
                     identity: identity,
                     client: Self.clientInfo()
                 )
@@ -300,6 +343,15 @@ public final class ChatSession: ObservableObject {
                 // Anonymous now, and the composer will ask for a name and email.
                 // What they typed is not lost; the caller still holds it.
                 errorMessage = nil
+                return
+            }
+            if case let .missingDetail(raw, message)? = error as? ChatError,
+               let field = ChatPrechat.Field(rawValue: raw) {
+                // A detail the form didn't ask for (a signed-in user's, or a
+                // setting changed since the config loaded): ask for it now.
+                askedFields.insert(field)
+                errorField = field
+                errorMessage = message
                 return
             }
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "Couldn't send"
@@ -599,6 +651,8 @@ public final class ChatSession: ObservableObject {
         unreadCount = 0
         otherOpenConversations = []
         history = []
+        askedFields = []
+        errorField = nil
         // The facts stay — they are about this customer, not this chat. Only
         // the record of having sent them is dropped, so the next conversation
         // gets its own copy.

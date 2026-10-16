@@ -9,6 +9,9 @@ public struct ChatWidgetConfig: Decodable, Equatable {
     public let online: Bool
     public let pipelines: [ChatPipelineInfo]
     public let features: Features?
+    /// What to ask before a chat starts. Absent on a server older than this
+    /// SDK, which keeps the old form: name and email optional, no phone.
+    public var prechat: ChatPrechat? = nil
 
     public struct Features: Decodable, Equatable {
         public let identity: Bool
@@ -210,7 +213,99 @@ public struct ChatConversationSummary: Identifiable, Equatable {
     }
 }
 
-struct ErrorBody: Decodable { let error: String }
+struct ErrorBody: Decodable {
+    let error: String
+    /// Which detail the server still needs ("name" | "email" | "phone").
+    var field: String? = nil
+}
+
+/// Whether the widget asks for a detail before a chat starts.
+public enum ChatPrechatMode: String, Decodable, Equatable {
+    case required, optional, off
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        // Anything unknown is the strict reading, as on the server.
+        self = ChatPrechatMode(rawValue: raw) ?? .required
+    }
+}
+
+/// What a visitor is asked for before their first message. The server
+/// enforces it; checking here first just means nobody waits to hear it.
+public struct ChatPrechat: Decodable, Equatable {
+    public var name: ChatPrechatMode
+    public var email: ChatPrechatMode
+    public var phone: ChatPrechatMode
+
+    public init(name: ChatPrechatMode, email: ChatPrechatMode, phone: ChatPrechatMode) {
+        self.name = name
+        self.email = email
+        self.phone = phone
+    }
+
+    /// What a server too old to say has always done.
+    public static let legacy = ChatPrechat(name: .optional, email: .optional, phone: .off)
+
+    public enum Field: String, CaseIterable { case name, email, phone }
+
+    public func mode(_ field: Field) -> ChatPrechatMode {
+        switch field {
+        case .name: return name
+        case .email: return email
+        case .phone: return phone
+        }
+    }
+
+    /// Must be filled in. With nobody online an email is the only way back to
+    /// the customer, unless the widget never asks for one.
+    public func isRequired(_ field: Field, online: Bool) -> Bool {
+        let m = mode(field)
+        if field == .email, !online, m != .off { return true }
+        return m == .required
+    }
+
+    /// The first problem with what was typed, as (field, message), or nil.
+    /// `asked` is the fields on screen; nothing else is checked.
+    public func check(
+        name: String?, email: String?, phone: String?,
+        asked: Set<Field>, online: Bool
+    ) -> (field: Field, message: String)? {
+        func clean(_ s: String?) -> String? {
+            let t = s?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return t.isEmpty ? nil : t
+        }
+        let values: [Field: String?] = [.name: clean(name), .email: clean(email), .phone: clean(phone)]
+        for f in Field.allCases where asked.contains(f) {
+            let v = values[f] ?? nil
+            if v == nil, isRequired(f, online: online) {
+                switch f {
+                case .name: return (f, "Please enter your name")
+                case .email: return (f, online ? "Please enter your email" : "Leave your email so we can get back to you")
+                case .phone: return (f, "Please enter your phone number")
+                }
+            }
+            if f == .email, let v, !Self.isValidEmail(v) {
+                return (f, "That email address doesn't look right")
+            }
+            if f == .phone, let v, !Self.isValidPhone(v) {
+                return (f, "That phone number doesn't look right")
+            }
+        }
+        return nil
+    }
+
+    static func isValidEmail(_ v: String) -> Bool {
+        v.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil
+    }
+
+    /// Digits with optional +, spaces, dots, dashes and parentheses; 7–20
+    /// digits. The same rule as the server.
+    static func isValidPhone(_ v: String) -> Bool {
+        guard v.range(of: #"^\+?[0-9\s().-]+$"#, options: .regularExpression) != nil else { return false }
+        let digits = v.filter(\.isNumber).count
+        return (7...20).contains(digits)
+    }
+}
 
 /// A signed-in user, vouched for by the app's own server.
 public struct ChatIdentity: Equatable, Codable {
@@ -219,6 +314,7 @@ public struct ChatIdentity: Equatable, Codable {
     public let signature: String
     public let name: String?
     public let email: String?
+    public var phone: String? = nil
     /// Display-only facts for the agent to see, e.g. ["Next trip": "AUS→DAL Oct 8"].
     /// Never trusted for anything: only `signature` proves who this is.
     public let attributes: [String: String]?
@@ -228,12 +324,14 @@ public struct ChatIdentity: Equatable, Codable {
         signature: String,
         name: String? = nil,
         email: String? = nil,
+        phone: String? = nil,
         attributes: [String: String]? = nil
     ) {
         self.userId = userId
         self.signature = signature
         self.name = name
         self.email = email
+        self.phone = phone
         self.attributes = attributes
     }
 }
@@ -241,12 +339,16 @@ public struct ChatIdentity: Equatable, Codable {
 public enum ChatError: LocalizedError, Equatable {
     case notConfigured
     case server(status: Int, message: String)
+    /// The server won't start the chat without this detail ("name" |
+    /// "email" | "phone"); the chat screen shows the field.
+    case missingDetail(field: String, message: String)
     case network(String)
 
     public var errorDescription: String? {
         switch self {
         case .notConfigured: return "SendSyncChat.configure(widgetKey:) hasn't been called."
         case let .server(_, message): return message
+        case let .missingDetail(_, message): return message
         case let .network(message): return message
         }
     }
